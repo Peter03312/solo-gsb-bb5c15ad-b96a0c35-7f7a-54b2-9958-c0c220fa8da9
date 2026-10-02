@@ -48,7 +48,16 @@ def init_db(retries: int = 30, delay: float = 1.0) -> None:
             time.sleep(delay)
     else:
         raise RuntimeError(f"cannot initialize database: {last_err}")
+    _init_change_seq()
     _create_exclusion_constraint()
+
+
+def _init_change_seq() -> None:
+    """初始化变更游标计数器的单行（id=0, last_seq=0）。"""
+    with engine.begin() as conn:
+        conn.execute(
+            text("INSERT INTO change_seq (id, last_seq) VALUES (0, 0) ON CONFLICT DO NOTHING")
+        )
 
 
 def _create_exclusion_constraint() -> None:

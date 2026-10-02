@@ -47,6 +47,15 @@ req GET "/shifts/1/result"
 req GET "/shifts/1/result?revision=1"
 req GET "/shifts/1/revisions"
 
+echo "-- 下游同步：从头回放变更（settle=seq1, correction=seq2）--"
+req GET "/sync/changes?limit=1"
+req GET "/sync/changes?cursor=1"
+echo "-- 空页：next_cursor 保持为 cursor --"
+req GET "/sync/changes?cursor=2"
+echo "-- 非法游标 / 超限页大小，预期 422 且不改变同步进度 --"
+req GET "/sync/changes?cursor=999999"
+req GET "/sync/changes?limit=501"
+
 echo "-- 非法区间 / 未知设备，预期 422 / 404 --"
 req POST /shifts '{"device_id":"CNC-01","start":"2026-10-02T16:00:00+08:00","end":"2026-10-02T08:00:00+08:00"}'
 req POST /events '{"device_id":"NOPE","source_id":"X","version":1,"start":"2026-10-01T10:00:00+08:00","end":"2026-10-01T11:00:00+08:00","reason":"failure"}'

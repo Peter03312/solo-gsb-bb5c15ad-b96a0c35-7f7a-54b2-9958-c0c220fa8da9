@@ -6,15 +6,19 @@ import hashlib
 from datetime import datetime, timezone
 
 from fastapi import HTTPException
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from . import attribution
 from .attribution import EventView
-from .models import Device, EventSource, EventVersion, Shift, ShiftResult
+from .models import ChangeSeq, Device, EventSource, EventVersion, Shift, ShiftResult, ShiftResultChange
 from .schemas import DeviceCreate, EventIn, ShiftCreate
+
+# 同步分页默认与上限
+SYNC_DEFAULT_LIMIT = 100
+SYNC_MAX_LIMIT = 500
 
 
 class ApiError(HTTPException):
@@ -195,6 +199,47 @@ def _new_revision(
     return rev
 
 
+def _append_changes(
+    db: Session, pairs: list[tuple[Shift, ShiftResult]]
+) -> list[ShiftResultChange]:
+    """为本事务内新建的修订分配全局连续游标并写入变更日志。
+
+    与修订行在同一事务中：提交后同时可见，回滚则同时消失。
+    对单行计数器加行锁并持锁至提交：游标按提交顺序分配、无空隙，
+    因而任何已提交游标之前都不存在"尚未可见"的较早变更。
+    """
+    if not pairs:
+        return []
+    db.execute(
+        pg_insert(ChangeSeq).values(id=0, last_seq=0).on_conflict_do_nothing()
+    )
+    counter = db.execute(
+        select(ChangeSeq).where(ChangeSeq.id == 0).with_for_update()
+    ).scalar_one()
+    changes: list[ShiftResultChange] = []
+    for shift, rev in pairs:
+        counter.last_seq += 1
+        db.flush()  # 固化自增后的值，供下面作为主键使用
+        change = ShiftResultChange(
+            seq=counter.last_seq,
+            shift_id=shift.id,
+            device_id=shift.device_id,
+            shift_start=shift.start_ts,
+            shift_end=shift.end_ts,
+            revision=rev.revision,
+            maintenance_minutes=rev.maintenance_minutes,
+            failure_minutes=rev.failure_minutes,
+            pending_minutes=rev.pending_minutes,
+            d_maintenance=rev.d_maintenance,
+            d_failure=rev.d_failure,
+            d_pending=rev.d_pending,
+            trigger=rev.trigger,
+        )
+        db.add(change)
+        changes.append(change)
+    return changes
+
+
 # ---------------------------------------------------------------- 结算
 
 
@@ -210,6 +255,7 @@ def settle_shift(db: Session, shift_id: int) -> tuple[Shift, ShiftResult, bool]:
         return shift, latest, False
     totals, used = _compute(db, shift)
     rev = _new_revision(db, shift, totals, used, trigger="settle", base=None)
+    _append_changes(db, [(shift, rev)])
     db.commit()
     db.refresh(rev)
     return shift, rev, True
@@ -317,6 +363,7 @@ def _recompute_affected_shifts(
             select(Shift)
             .where(Shift.device_id == device_id, or_(*conds))
             .with_for_update()
+            .order_by(Shift.id)
         )
         .scalars()
         .all()
@@ -337,6 +384,8 @@ def _recompute_affected_shifts(
         rev = _new_revision(db, shift, totals, used, trigger="correction", base=latest)
         db.flush()
         recomputed.append((shift, rev))
+    # 全部修订与其变更在同一事务提交；多条更正按班次 id 顺序连续取号
+    _append_changes(db, recomputed)
     return recomputed
 
 
@@ -379,3 +428,39 @@ def list_revisions(db: Session, shift_id: int) -> tuple[Shift, list[ShiftResult]
         .all()
     )
     return shift, list(revs)
+
+
+# ---------------------------------------------------------------- 下游同步（变更游标）
+
+
+def list_changes(
+    db: Session, cursor: int, limit: int
+) -> tuple[list[ShiftResultChange], int, int]:
+    """按全局游标读取变更页。
+
+    返回 (变更条目（按 seq 升序）, 下一游标, 当前最大游标)。
+    - 起始游标 0：从头回放全部既有修订；
+    - 空页（cursor 已到最新）：下一游标 = cursor，保持不变；
+    - 游标不可超过当前最大值（指向尚不存在的位置属非法游标）。
+    """
+    max_seq = db.execute(
+        select(func.coalesce(func.max(ShiftResultChange.seq), 0))
+    ).scalar_one()
+    if cursor < 0 or cursor > max_seq:
+        raise ApiError(
+            422,
+            "INVALID_CURSOR",
+            f"cursor must be in [0, {max_seq}], got {cursor}",
+        )
+    rows = list(
+        db.execute(
+            select(ShiftResultChange)
+            .where(ShiftResultChange.seq > cursor)
+            .order_by(ShiftResultChange.seq)
+            .limit(limit)
+        )
+        .scalars()
+        .all()
+    )
+    next_cursor = rows[-1].seq if rows else cursor
+    return rows, next_cursor, max_seq

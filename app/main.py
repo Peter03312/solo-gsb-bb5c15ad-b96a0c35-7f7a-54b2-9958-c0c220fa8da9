@@ -12,8 +12,10 @@ from sqlalchemy.orm import Session
 
 from . import services
 from .db import get_db, init_db
-from .models import Shift, ShiftResult
+from .models import Shift, ShiftResult, ShiftResultChange
 from .schemas import (
+    ChangeOut,
+    ChangePage,
     DeviceCreate,
     DeviceOut,
     EventAccepted,
@@ -214,3 +216,61 @@ def list_revisions(shift_id: int, db: Session = Depends(get_db)):
     shift, revs = services.list_revisions(db, shift_id)
     latest_revision = revs[-1].revision if revs else 0
     return [_result_out(shift, rev, latest_revision) for rev in revs]
+
+
+# ---------------------------------------------------------------- 下游同步
+
+
+def _change_out(ch: ShiftResultChange) -> ChangeOut:
+    return ChangeOut(
+        seq=ch.seq,
+        shift_id=ch.shift_id,
+        device_id=ch.device_id,
+        shift_start=ch.shift_start,
+        shift_end=ch.shift_end,
+        revision=ch.revision,
+        totals=ReasonMinutes(
+            maintenance=ch.maintenance_minutes,
+            failure=ch.failure_minutes,
+            pending=ch.pending_minutes,
+        ),
+        delta=ReasonMinutes(
+            maintenance=ch.d_maintenance,
+            failure=ch.d_failure,
+            pending=ch.d_pending,
+        ),
+        trigger=ch.trigger,
+        created_at=ch.created_at,
+    )
+
+
+@app.get("/sync/changes", response_model=ChangePage, tags=["sync"])
+def get_sync_changes(
+    cursor: int = Query(
+        default=0,
+        ge=0,
+        description="起始游标（不含）：0 表示从头回放；传入上次返回的 next_cursor 续读",
+    ),
+    limit: int = Query(
+        default=services.SYNC_DEFAULT_LIMIT,
+        ge=1,
+        le=services.SYNC_MAX_LIMIT,
+        description=f"每页条数，1..{services.SYNC_MAX_LIMIT}",
+    ),
+    db: Session = Depends(get_db),
+):
+    """下游报表同步：按全局递增游标分页读取班次归因的每次结算与更正。
+
+    - 返回按 seq 升序的变更页，每条含班次、修订号、各原因分钟数、差额与触发类型；
+    - 用响应中的 next_cursor 作为下次请求的 cursor 续读后续变更；
+    - 空页 next_cursor 与 cursor 相同（追上后轮询游标不变）；
+    - 游标指向不存在的位置 → 422 INVALID_CURSOR；页大小越界 → 422，均不改变同步进度。
+    """
+    rows, next_cursor, max_cursor = services.list_changes(db, cursor, limit)
+    return ChangePage(
+        changes=[_change_out(r) for r in rows],
+        cursor=cursor,
+        next_cursor=next_cursor,
+        max_cursor=max_cursor,
+        limit=limit,
+    )

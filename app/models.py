@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from sqlalchemy import (
+    BigInteger,
     CheckConstraint,
     DateTime,
     ForeignKey,
@@ -115,4 +116,55 @@ class ShiftResult(Base):
 
     __table_args__ = (
         UniqueConstraint("shift_id", "revision", name="uq_shift_result_revision"),
+    )
+
+
+class ChangeSeq(Base):
+    """变更游标的全局单行计数器。
+
+    每次追加变更时对该行加行锁并自增，直到事务提交才释放：
+    序号按提交顺序分配且无空隙，保证游标不会越过尚未可见的较早变更。
+    """
+
+    __tablename__ = "change_seq"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    last_seq: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+
+    __table_args__ = (CheckConstraint("id = 0", name="ck_change_seq_singleton"),)
+
+
+class ShiftResultChange(Base):
+    """下游报表同步用的变更日志（outbox）：每条对应一次结算或更正产生的新修订。
+
+    与对应 ShiftResult 在同一事务中写入（同提交 / 同回滚）；
+    seq 全局严格递增、连续无空隙且不可变，作为同步分页游标。
+    快照字段在插入时固化，重读已返回的条目内容永远不变。
+    """
+
+    __tablename__ = "shift_result_changes"
+
+    seq: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    shift_id: Mapped[int] = mapped_column(
+        ForeignKey("shifts.id"), nullable=False, index=True
+    )
+    device_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    shift_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    shift_end: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    maintenance_minutes: Mapped[int] = mapped_column(Integer, nullable=False)
+    failure_minutes: Mapped[int] = mapped_column(Integer, nullable=False)
+    pending_minutes: Mapped[int] = mapped_column(Integer, nullable=False)
+    d_maintenance: Mapped[int] = mapped_column(Integer, nullable=False)
+    d_failure: Mapped[int] = mapped_column(Integer, nullable=False)
+    d_pending: Mapped[int] = mapped_column(Integer, nullable=False)
+    trigger: Mapped[str] = mapped_column(String(16), nullable=False)  # settle | correction
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "trigger IN ('settle','correction')", name="ck_change_trigger"
+        ),
     )

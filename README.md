@@ -58,6 +58,10 @@ docker compose exec app pytest            # 算法单测 + API 端到端测试
 - **结算与修订**：`POST /shifts/{id}/settle` 结算生成修订 1 并永久保留；迟到更正按事件时间
   （新旧版本区间的并集）重算受影响的已结算班次，结果变化时追加新修订并记录与上一修订的
   差额（`delta`）；查询可用 `?revision=N` 指定历史修订。
+- **下游同步（变更游标）**：`GET /sync/changes` 提供全局严格递增、连续无空隙的变更流，覆盖每次
+  结算与更正产生的新修订（归因结果未变化则不产生变更）。变更与其修订在**同一事务**提交/回滚；
+  游标按事务提交顺序分配，并发写入下游也不会读到"越过尚未可见的较早变更"的页面；条目快照不可变，
+  重读同一 `seq` 内容永远一致。
 - **错误**：未知设备 `404 DEVICE_NOT_FOUND`，非法区间 `422`，未结算 `404 RESULT_NOT_FOUND`，
   未知班次/修订 `404`。错误体统一为 `{"detail": {"code": "...", "message": "..."}}`。
 
@@ -73,6 +77,7 @@ docker compose exec app pytest            # 算法单测 + API 端到端测试
 | `POST` | `/shifts/{id}/settle` | 结算班次（重复调用幂等返回最新修订） |
 | `GET` | `/shifts/{id}/result?revision=N` | 查询归因结果，缺省最新修订 |
 | `GET` | `/shifts/{id}/revisions` | 全部修订及差额 |
+| `GET` | `/sync/changes?cursor=N&limit=M` | 下游同步：按全局游标分页读取结算/更正变更 |
 | `GET` | `/health` | 健康检查 |
 
 原因枚举：`maintenance`（保养）、`failure`（故障）、`pending`（待判）。
@@ -88,7 +93,8 @@ docker compose exec app pytest            # 算法单测 + API 端到端测试
 | 409 | `SHIFT_OVERLAP` | 同设备班次区间重叠 |
 | 409 | `VERSION_CONFLICT` | 同来源同版本但内容不同 |
 | 409 | `VERSION_GAP` | 版本跳号（含首版本不为 1） |
-| 422 | `VALIDATION_ERROR` | 非法参数：区间无效、缺时区、未对齐整分钟、原因非法等 |
+| 422 | `VALIDATION_ERROR` | 非法参数：区间无效、缺时区、未对齐整分钟、原因非法、页大小越界等 |
+| 422 | `INVALID_CURSOR` | 同步游标非法（负数或超过当前最大游标） |
 
 ## 调用示例
 
@@ -203,7 +209,108 @@ curl 'http://localhost:8000/shifts/1/result?revision=1'   # 指定修订：结�
 curl http://localhost:8000/shifts/1/revisions             # 全部修订及每次差额
 ```
 
-**9. 错误示例**
+**9. 下游报表同步**：按全局游标分页拉取每次结算与更正
+
+游标语义：
+
+- `cursor` 为"已读到的位置"（不含），首次用 `0` 即可**回放全部既有修订**；
+- 每页按 `seq` 升序返回至多 `limit` 条变更，响应中的 `next_cursor` 是下次请求的 `cursor`；
+- **空页保持原游标**（`next_cursor == cursor`），追上后可轮询；`max_cursor == next_cursor` 即已追上；
+- 每条 `seq` 全局严格递增、连续无空隙，且内容（含班次、修订号、各原因分钟数、差额、触发类型）是
+  插入时的不可变快照；
+- 归因结果未变化的更正不产生变更；
+- `cursor` 超过当前最大值（或为负）→ `422 INVALID_CURSOR`；`limit` 须在 `1..500`（默认 100），
+  越界 → `422`；非法请求不推进任何同步进度（进度完全由下游保存的游标决定）。
+
+```bash
+# 首次：cursor=0（可省略）从头回放，每页 100 条
+curl 'http://localhost:8000/sync/changes?cursor=0&limit=100'
+```
+
+```json
+{
+  "changes": [
+    {
+      "seq": 1,
+      "shift_id": 1,
+      "device_id": "CNC-01",
+      "shift_start": "2026-10-01T00:00:00Z",
+      "shift_end": "2026-10-01T08:00:00Z",
+      "revision": 1,
+      "totals": {"maintenance": 60, "failure": 60, "pending": 0},
+      "delta":  {"maintenance": 60, "failure": 60, "pending": 0},
+      "trigger": "settle",
+      "created_at": "2026-10-02T09:00:00Z"
+    },
+    {
+      "seq": 2,
+      "shift_id": 1,
+      "device_id": "CNC-01",
+      "shift_start": "2026-10-01T00:00:00Z",
+      "shift_end": "2026-10-01T08:00:00Z",
+      "revision": 2,
+      "totals": {"maintenance": 60, "failure": 30, "pending": 0},
+      "delta":  {"maintenance": 0,  "failure": -30, "pending": 0},
+      "trigger": "correction",
+      "created_at": "2026-10-02T09:05:00Z"
+    }
+  ],
+  "cursor": 0,
+  "next_cursor": 2,
+  "max_cursor": 2,
+  "limit": 100
+}
+```
+
+```bash
+# 续读后续变更：用上次的 next_cursor
+curl 'http://localhost:8000/sync/changes?cursor=2'
+# 暂无新变更 → 空页，next_cursor 保持 2
+# {"changes":[],"cursor":2,"next_cursor":2,"max_cursor":2,"limit":100}
+
+# 小页回放（例如迁移/补偿时逐页拉取）
+curl 'http://localhost:8000/sync/changes?cursor=0&limit=1'   # 只返回 seq=1，next_cursor=1
+
+# 非法游标 / 超限页大小 → 422，不影响同步进度
+curl 'http://localhost:8000/sync/changes?cursor=999999'
+# {"detail":{"code":"INVALID_CURSOR","message":"cursor must be in [0, 2], got 999999"}}
+curl 'http://localhost:8000/sync/changes?limit=501'          # 422 VALIDATION_ERROR
+```
+
+一个持续同步的最小循环（保存好 `next_cursor` 即可实现 at-least-once，重读旧 `seq` 内容不变，
+下游按 `(shift_id, revision)` 或 `seq` 去重即可）：
+
+```bash
+cursor=0
+while true; do
+  body=$(curl -sS "http://localhost:8000/sync/changes?cursor=${cursor}&limit=100")
+  echo "$body" | jq -c '.changes[]'                    # 逐条 upsert 到报表库
+  cursor=$(echo "$body" | jq -r '.next_cursor')
+  [ "$(echo "$body" | jq -r '.changes | length')" = 0 ] && sleep 5
+done
+```
+
+Python 示例：
+
+```python
+import requests
+
+cursor, limit = 0, 100
+while True:
+    page = requests.get(
+        "http://localhost:8000/sync/changes",
+        params={"cursor": cursor, "limit": limit},
+        timeout=10,
+    ).json()
+    for ch in page["changes"]:
+        # 按 (shift_id, revision) upsert：totals 为该修订全量值，delta 为与上一修订的差额
+        upsert_report(ch)
+    cursor = page["next_cursor"]  # 空页时等于原游标，可安全轮询
+    if not page["changes"]:
+        time.sleep(5)
+```
+
+**10. 错误示例**
 
 ```bash
 # 非法区间（start ≥ end、秒非 00、缺时区）→ 422
@@ -229,6 +336,11 @@ curl -X POST http://localhost:8000/events -H 'Content-Type: application/json' \
 - **并发与一致性**：班次不重叠由 PostgreSQL 排他约束（`btree_gist` + `tstzrange '[)'`）兜底；
   结算与更正重算时对班次行加锁；事件版本链对来源行加锁，全流程单事务提交。
 - **不可变历史**：`shift_results` 只追加不修改，`(shift_id, revision)` 唯一。
+- **变更游标**（`shift_result_changes` outbox + `change_seq` 单行计数器）：每次追加修订时在
+  **同一事务**内对计数器行 `SELECT ... FOR UPDATE` 自增并持锁至提交，因此 `seq` 按提交顺序分配、
+  连续无空隙 —— 一个序号被外部读到时，它之前的所有序号必然已经提交可见，游标不可能越过尚未可见
+  的较早变更；快照列在插入时固化，历史修订又只追加不修改，故重读同一 `seq` 内容永远不变。
+  一次更正涉及多个班次时，其多条修订与变更同样在同一事务内连续取号、一次提交。
 
 ## 项目结构
 

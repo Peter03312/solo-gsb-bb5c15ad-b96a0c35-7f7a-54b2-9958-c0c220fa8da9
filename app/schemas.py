@@ -114,3 +114,28 @@ class ResultOut(BaseModel):
 class SettleResponse(BaseModel):
     settled: bool  # False 表示此前已结算，本次为幂等返回最新修订
     result: ResultOut
+
+
+class ChangeOut(BaseModel):
+    """下游同步变更流中的一条：某班次的一次结算或更正修订（快照不可变）。"""
+
+    seq: int  # 全局递增游标
+    shift_id: int
+    device_id: str
+    shift_start: datetime
+    shift_end: datetime
+    revision: int
+    totals: ReasonMinutes
+    delta: ReasonMinutes  # 本修订相对上一修订的差额（首修订相对 0）
+    trigger: str  # settle | correction
+    created_at: datetime
+
+
+class ChangePage(BaseModel):
+    """变更分页：用 next_cursor 继续读取；空页时 next_cursor == cursor。"""
+
+    changes: list[ChangeOut]
+    cursor: int  # 本次请求使用的游标
+    next_cursor: int  # 下一页游标；空页保持为 cursor
+    max_cursor: int  # 当前全局最大游标（next_cursor == max_cursor 即已追上）
+    limit: int
