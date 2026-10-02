@@ -14,6 +14,8 @@ from . import services
 from .db import get_db, init_db
 from .models import Shift, ShiftResult
 from .schemas import (
+    ChangeEntry,
+    ChangePage,
     DeviceCreate,
     DeviceOut,
     EventAccepted,
@@ -36,11 +38,12 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="设备停机归因服务",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "按班次对设备停机时间进行归因（保养/故障/待判）。"
         "区间均为半开 [start, end)；重叠时保养 > 故障 > 待判，每分钟只归因一次；"
-        "事件按 (来源, 连续版本) 上报，支持幂等与迟到更正重算。"
+        "事件按 (来源, 连续版本) 上报，支持幂等与迟到更正重算；"
+        "GET /changes 提供按全局递增游标分页的结算/更正变更流，供下游报表同步。"
     ),
     lifespan=lifespan,
 )
@@ -214,3 +217,58 @@ def list_revisions(shift_id: int, db: Session = Depends(get_db)):
     shift, revs = services.list_revisions(db, shift_id)
     latest_revision = revs[-1].revision if revs else 0
     return [_result_out(shift, rev, latest_revision) for rev in revs]
+
+
+# ---------------------------------------------------------------- 变更同步
+
+
+def _change_entry(shift: Shift, rev: ShiftResult) -> ChangeEntry:
+    return ChangeEntry(
+        seq=rev.seq,
+        shift_id=shift.id,
+        device_id=shift.device_id,
+        shift_start=shift.start_ts,
+        shift_end=shift.end_ts,
+        revision=rev.revision,
+        totals=ReasonMinutes(
+            maintenance=rev.maintenance_minutes,
+            failure=rev.failure_minutes,
+            pending=rev.pending_minutes,
+        ),
+        delta=ReasonMinutes(
+            maintenance=rev.d_maintenance,
+            failure=rev.d_failure,
+            pending=rev.d_pending,
+        ),
+        event_versions=[EventVersionRef(**ev) for ev in rev.event_versions],
+        trigger=rev.trigger,
+        created_at=rev.created_at,
+    )
+
+
+@app.get("/changes", response_model=ChangePage, tags=["sync"])
+def list_changes(
+    cursor: int = Query(
+        default=0, ge=0, description="已消费的最大变更序号；0（缺省）表示从头回放"
+    ),
+    limit: int = Query(
+        default=100,
+        ge=1,
+        le=services.MAX_PAGE_SIZE,
+        description=f"每页条数，上限 {services.MAX_PAGE_SIZE}",
+    ),
+    db: Session = Depends(get_db),
+):
+    """下游报表同步：按全局递增游标分页读取每次结算/更正产生的变更。
+
+    - 每条含班次、修订号、各原因分钟数、差额与触发类型；
+    - 修订与变更记录同事务提交/回滚；序号顺序即提交顺序，
+      并发结算/更正时游标不会越过尚未可见的较早变更；
+    - 已返回条目不可变，重读内容不变；空页保持原游标；
+    - 非法游标（负数、超过当前最大序号）或超限页大小返回 422。
+    """
+    page, next_cursor = services.list_changes(db, cursor, limit)
+    return ChangePage(
+        changes=[_change_entry(shift, rev) for rev, shift in page],
+        next_cursor=next_cursor,
+    )

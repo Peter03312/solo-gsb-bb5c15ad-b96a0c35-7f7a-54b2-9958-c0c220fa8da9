@@ -10,7 +10,14 @@ from sqlalchemy import text
 from app.db import engine
 from app.main import app
 
-TABLES = ("shift_results", "event_versions", "event_sources", "shifts", "devices")
+TABLES = (
+    "shift_results",
+    "event_versions",
+    "event_sources",
+    "shifts",
+    "devices",
+    "change_counter",
+)
 
 DEVICE = {"id": "CNC-01", "name": "加工中心1号"}
 SHIFT = {

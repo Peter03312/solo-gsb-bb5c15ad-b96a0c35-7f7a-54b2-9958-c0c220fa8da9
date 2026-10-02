@@ -47,6 +47,18 @@ req GET "/shifts/1/result"
 req GET "/shifts/1/result?revision=1"
 req GET "/shifts/1/revisions"
 
+echo "-- 变更同步：从游标 0 回放（每页 1 条），再用 next_cursor 翻页 --"
+req GET "/changes?cursor=0&limit=1"
+req GET "/changes?cursor=1&limit=10"
+
+echo "-- 已追平：空页保持原游标 --"
+req GET "/changes?cursor=2"
+
+echo "-- 非法游标 / 超限页大小，预期 422 --"
+req GET "/changes?cursor=-1"
+req GET "/changes?cursor=999"
+req GET "/changes?limit=1000"
+
 echo "-- 非法区间 / 未知设备，预期 422 / 404 --"
 req POST /shifts '{"device_id":"CNC-01","start":"2026-10-02T16:00:00+08:00","end":"2026-10-02T08:00:00+08:00"}'
 req POST /events '{"device_id":"NOPE","source_id":"X","version":1,"start":"2026-10-01T10:00:00+08:00","end":"2026-10-01T11:00:00+08:00","reason":"failure"}'

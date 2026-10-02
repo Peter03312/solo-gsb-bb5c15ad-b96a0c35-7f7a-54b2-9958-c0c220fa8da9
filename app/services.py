@@ -6,14 +6,14 @@ import hashlib
 from datetime import datetime, timezone
 
 from fastapi import HTTPException
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from . import attribution
 from .attribution import EventView
-from .models import Device, EventSource, EventVersion, Shift, ShiftResult
+from .models import ChangeCounter, Device, EventSource, EventVersion, Shift, ShiftResult
 from .schemas import DeviceCreate, EventIn, ShiftCreate
 
 
@@ -111,6 +111,24 @@ def get_shift_or_404(db: Session, shift_id: int) -> Shift:
 # ---------------------------------------------------------------- 归因计算
 
 
+def _allocate_seq(db: Session) -> int:
+    """分配全局递增的变更序号。
+
+    单例计数器行在写事务内 UPDATE ... RETURNING 递增，行锁持有至提交：
+    序号顺序 == 提交顺序，同步游标因此不会越过尚未可见的较早变更；
+    序号与修订在同一事务写入，同时提交或同时回滚。
+    """
+    db.execute(
+        pg_insert(ChangeCounter).values(id=1, last_seq=0).on_conflict_do_nothing()
+    )
+    return db.execute(
+        update(ChangeCounter)
+        .where(ChangeCounter.id == 1)
+        .values(last_seq=ChangeCounter.last_seq + 1)
+        .returning(ChangeCounter.last_seq)
+    ).scalar_one()
+
+
 def _current_event_views(
     db: Session, device_id: str, start: datetime, end: datetime
 ) -> list[EventView]:
@@ -182,6 +200,7 @@ def _new_revision(
     rev = ShiftResult(
         shift_id=shift.id,
         revision=revision,
+        seq=_allocate_seq(db),
         maintenance_minutes=totals["maintenance"],
         failure_minutes=totals["failure"],
         pending_minutes=totals["pending"],
@@ -316,6 +335,7 @@ def _recompute_affected_shifts(
         db.execute(
             select(Shift)
             .where(Shift.device_id == device_id, or_(*conds))
+            .order_by(Shift.id)  # 固定加锁顺序，降低并发更正相互死锁的概率
             .with_for_update()
         )
         .scalars()
@@ -379,3 +399,40 @@ def list_revisions(db: Session, shift_id: int) -> tuple[Shift, list[ShiftResult]
         .all()
     )
     return shift, list(revs)
+
+
+# ---------------------------------------------------------------- 变更同步
+
+#: GET /changes 允许的页大小上限
+MAX_PAGE_SIZE = 500
+
+
+def list_changes(
+    db: Session, cursor: int, limit: int
+) -> tuple[list[tuple[ShiftResult, Shift]], int]:
+    """按全局递增游标分页读取结算/更正变更，返回 ([(修订, 班次)], 下一游标)。
+
+    - 返回 seq > cursor 的变更，按 seq 升序，最多 limit 条；
+    - 空页保持原游标（客户端已追平，可原地轮询）；
+    - 游标超过当前最大序号视为非法（客户端进度与服务端不一致），
+      明确拒绝且不影响任何同步进度。
+    """
+    if cursor > 0:
+        max_seq = db.execute(select(func.max(ShiftResult.seq))).scalar() or 0
+        if cursor > max_seq:
+            raise ApiError(
+                422,
+                "INVALID_CURSOR",
+                f"cursor {cursor} is beyond the latest change seq {max_seq}; "
+                "restart sync from a smaller cursor (0 replays from the beginning)",
+            )
+    rows = db.execute(
+        select(ShiftResult, Shift)
+        .join(Shift, Shift.id == ShiftResult.shift_id)
+        .where(ShiftResult.seq > cursor)
+        .order_by(ShiftResult.seq)
+        .limit(limit)
+    ).all()
+    page = [(rev, shift) for rev, shift in rows]
+    next_cursor = page[-1][0].seq if page else cursor
+    return page, next_cursor

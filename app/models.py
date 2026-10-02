@@ -86,10 +86,26 @@ class EventVersion(Base):
     )
 
 
+class ChangeCounter(Base):
+    """变更序号计数器（单例行 id=1）。
+
+    分配序号时在写事务内对该行 UPDATE ... RETURNING 递增，行锁持有至提交，
+    因此序号顺序 == 提交顺序：seq 较小的变更不会晚于 seq 较大的变更可见，
+    下游同步游标据此不会越过尚未提交的较早变更。
+    """
+
+    __tablename__ = "change_counter"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)  # 恒为 1
+    last_seq: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+
 class ShiftResult(Base):
     """班次结算结果的一个修订。
 
     结算后原修订永久保留；迟到更正触发重算时追加新修订并记录与上一修订的差额。
+    seq 是全局递增的变更序号（提交顺序），下游按游标同步即读此表 ——
+    修订与其变更记录是同一行，天然同事务提交/回滚，且内容不可变。
     """
 
     __tablename__ = "shift_results"
@@ -99,6 +115,8 @@ class ShiftResult(Base):
         ForeignKey("shifts.id"), nullable=False, index=True
     )
     revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 全局递增变更序号（提交顺序），作为下游同步游标
+    seq: Mapped[int] = mapped_column(Integer, nullable=False)
     maintenance_minutes: Mapped[int] = mapped_column(Integer, nullable=False)
     failure_minutes: Mapped[int] = mapped_column(Integer, nullable=False)
     pending_minutes: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -115,4 +133,5 @@ class ShiftResult(Base):
 
     __table_args__ = (
         UniqueConstraint("shift_id", "revision", name="uq_shift_result_revision"),
+        UniqueConstraint("seq", name="uq_shift_results_seq"),
     )

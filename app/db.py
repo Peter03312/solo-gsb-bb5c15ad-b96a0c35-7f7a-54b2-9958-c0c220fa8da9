@@ -49,6 +49,59 @@ def init_db(retries: int = 30, delay: float = 1.0) -> None:
     else:
         raise RuntimeError(f"cannot initialize database: {last_err}")
     _create_exclusion_constraint()
+    _migrate_change_feed()
+
+
+def _migrate_change_feed() -> None:
+    """为既有库补齐变更同步结构（幂等，可重复执行）。
+
+    - shift_results 增加全局递增序号列 seq，并按原自增 id 顺序回填既有修订
+      （历史数据无法还原精确提交顺序，id 顺序是最接近的可用次序）；
+    - 单例计数器 change_counter 初始化为当前最大序号，之后由写事务内
+      行锁递增分配（见 services._allocate_seq）。
+    新建库由 create_all 直接建出完整结构，以下语句均为空操作。
+    """
+    with engine.begin() as conn:
+        conn.execute(
+            text("ALTER TABLE shift_results ADD COLUMN IF NOT EXISTS seq INTEGER")
+        )
+        conn.execute(
+            text(
+                """
+                DO $$
+                DECLARE
+                    base_seq int;
+                BEGIN
+                    SELECT COALESCE(MAX(seq), 0) INTO base_seq FROM shift_results;
+                    UPDATE shift_results r
+                    SET seq = base_seq + n.rn
+                    FROM (
+                        SELECT id, row_number() OVER (ORDER BY id) AS rn
+                        FROM shift_results
+                        WHERE seq IS NULL
+                    ) n
+                    WHERE r.id = n.id;
+                END
+                $$;
+                """
+            )
+        )
+        conn.execute(text("ALTER TABLE shift_results ALTER COLUMN seq SET NOT NULL"))
+        conn.execute(
+            text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_shift_results_seq "
+                "ON shift_results (seq)"
+            )
+        )
+        conn.execute(
+            text(
+                """
+                INSERT INTO change_counter (id, last_seq)
+                SELECT 1, COALESCE(MAX(seq), 0) FROM shift_results
+                ON CONFLICT (id) DO NOTHING
+                """
+            )
+        )
 
 
 def _create_exclusion_constraint() -> None:

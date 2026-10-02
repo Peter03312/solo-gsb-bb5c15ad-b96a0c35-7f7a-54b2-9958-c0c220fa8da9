@@ -2,7 +2,8 @@
 
 按**班次**对设备停机时间进行归因的 HTTP 服务：输入设备、班次（带时区、整分钟）与停机事件
 （来源编号 + 连续递增版本 + 起止 + 原因），输出各班次的**保养 / 故障 / 待判**分钟数及所依据
-的事件版本；支持事件幂等上报、版本链校验、迟到更正重算与结算修订查询。
+的事件版本；支持事件幂等上报、版本链校验、迟到更正重算与结算修订查询，并通过**全局递增游标**
+的变更流（`GET /changes`）供下游报表持续同步每次结算与更正。
 
 技术栈：Python 3.12 · FastAPI · SQLAlchemy 2 · PostgreSQL 16 · Docker Compose
 
@@ -58,6 +59,9 @@ docker compose exec app pytest            # 算法单测 + API 端到端测试
 - **结算与修订**：`POST /shifts/{id}/settle` 结算生成修订 1 并永久保留；迟到更正按事件时间
   （新旧版本区间的并集）重算受影响的已结算班次，结果变化时追加新修订并记录与上一修订的
   差额（`delta`）；查询可用 `?revision=N` 指定历史修订。
+- **变更同步**：每次结算与每次导致结果变化的更正产生一条变更记录（`seq` 全局递增），
+  `GET /changes?cursor=&limit=` 按游标分页读取；修订与变更记录同一行存储、同事务提交/回滚，
+  序号顺序即提交顺序，已返回条目不可变；空页保持原游标，非法游标/超限页大小返回 `422`。
 - **错误**：未知设备 `404 DEVICE_NOT_FOUND`，非法区间 `422`，未结算 `404 RESULT_NOT_FOUND`，
   未知班次/修订 `404`。错误体统一为 `{"detail": {"code": "...", "message": "..."}}`。
 
@@ -73,6 +77,7 @@ docker compose exec app pytest            # 算法单测 + API 端到端测试
 | `POST` | `/shifts/{id}/settle` | 结算班次（重复调用幂等返回最新修订） |
 | `GET` | `/shifts/{id}/result?revision=N` | 查询归因结果，缺省最新修订 |
 | `GET` | `/shifts/{id}/revisions` | 全部修订及差额 |
+| `GET` | `/changes?cursor=&limit=` | 变更同步：按全局递增游标分页读取结算/更正变更 |
 | `GET` | `/health` | 健康检查 |
 
 原因枚举：`maintenance`（保养）、`failure`（故障）、`pending`（待判）。
@@ -88,7 +93,8 @@ docker compose exec app pytest            # 算法单测 + API 端到端测试
 | 409 | `SHIFT_OVERLAP` | 同设备班次区间重叠 |
 | 409 | `VERSION_CONFLICT` | 同来源同版本但内容不同 |
 | 409 | `VERSION_GAP` | 版本跳号（含首版本不为 1） |
-| 422 | `VALIDATION_ERROR` | 非法参数：区间无效、缺时区、未对齐整分钟、原因非法等 |
+| 422 | `VALIDATION_ERROR` | 非法参数：区间无效、缺时区、未对齐整分钟、原因非法、游标/页大小越界等 |
+| 422 | `INVALID_CURSOR` | 同步游标超过当前最大变更序号（客户端进度异常，需从较小游标重新同步） |
 
 ## 调用示例
 
@@ -216,6 +222,73 @@ curl -X POST http://localhost:8000/events -H 'Content-Type: application/json' \
        "start":"2026-10-01T10:00:00+08:00","end":"2026-10-01T11:00:00+08:00","reason":"failure"}'
 ```
 
+## 变更同步（下游报表订阅）
+
+`GET /changes` 把每次**结算**与每次**导致结果变化的更正**暴露为按全局递增序号 `seq`
+排序的变更流，供下游报表持续同步。每条变更包含：班次（id、设备、起止）、修订号、
+各原因分钟数（`totals`）、与上一修订的差额（`delta`）、触发类型（`trigger`：
+`settle` / `correction`）、所依据的事件版本与产生时间。
+
+**游标语义**
+
+- 请求参数 `cursor` 表示"已消费的最大 `seq`"，返回 `seq > cursor` 的变更，按 `seq` 升序；
+  `cursor=0`（或缺省）表示从头回放全部既有修订。
+- 每页返回 `next_cursor`（本页最后一条的 `seq`），作为下一次请求的 `cursor` 即可翻页。
+- **空页保持原游标**：已追平时返回 `{"changes": [], "next_cursor": <原 cursor>}`，
+  客户端可用同一游标轮询等待新变更。
+- 页大小 `limit` 缺省 100，上限 500。
+
+**一致性保证**
+
+- 变更记录与对应修订是同一行（`shift_results.seq`），同一事务提交或回滚，不会半截可见；
+- 序号由单例计数器在写事务内加锁分配，**序号顺序 == 提交顺序**：并发结算/更正时，
+  游标不会越过尚未可见的较早变更；
+- 条目只追加不修改，重读已返回的内容不变；
+- 幂等重复上报/结算、结果未变化的更正均**不产生**变更记录。
+
+**参数约束**：`cursor ≥ 0` 且不得超过当前最大序号；`1 ≤ limit ≤ 500`。
+非法游标或超限页大小返回 `422`（只读请求，不影响任何同步进度）。
+
+**调用示例**（接上面主流程，此时已有结算 seq=1、更正 seq=2 两条变更）
+
+```bash
+# 1) 从头回放：第一页（每页 1 条）
+curl 'http://localhost:8000/changes?cursor=0&limit=1'
+```
+
+```json
+{
+  "changes": [{
+    "seq": 1, "shift_id": 1, "device_id": "CNC-01",
+    "shift_start": "2026-10-01T00:00:00Z", "shift_end": "2026-10-01T08:00:00Z",
+    "revision": 1,
+    "totals": {"maintenance": 60, "failure": 60, "pending": 0},
+    "delta":  {"maintenance": 60, "failure": 60, "pending": 0},
+    "event_versions": [
+      {"source_id": "MES-1", "version": 1, "reason": "maintenance"},
+      {"source_id": "PLC-9", "version": 1, "reason": "failure"}
+    ],
+    "trigger": "settle", "created_at": "..."
+  }],
+  "next_cursor": 1
+}
+```
+
+```bash
+# 2) 用上一页的 next_cursor 翻页
+curl 'http://localhost:8000/changes?cursor=1&limit=100'
+# → changes[0] 为 seq=2 的更正（trigger="correction"，delta.failure=-30），next_cursor=2
+
+# 3) 已追平：空页保持原游标，可轮询等待
+curl 'http://localhost:8000/changes?cursor=2'
+# → {"changes": [], "next_cursor": 2}
+
+# 4) 非法参数 → 422，同步进度不受影响
+curl 'http://localhost:8000/changes?cursor=-1'     # VALIDATION_ERROR
+curl 'http://localhost:8000/changes?limit=1000'    # VALIDATION_ERROR（上限 500）
+curl 'http://localhost:8000/changes?cursor=999'    # INVALID_CURSOR（超过当前最大序号）
+```
+
 ## 设计要点
 
 - **归因算法**（`app/attribution.py`，纯标准库可独立测试）：按原因收集区间并裁剪到班次窗口；
@@ -229,6 +302,11 @@ curl -X POST http://localhost:8000/events -H 'Content-Type: application/json' \
 - **并发与一致性**：班次不重叠由 PostgreSQL 排他约束（`btree_gist` + `tstzrange '[)'`）兜底；
   结算与更正重算时对班次行加锁；事件版本链对来源行加锁，全流程单事务提交。
 - **不可变历史**：`shift_results` 只追加不修改，`(shift_id, revision)` 唯一。
+- **变更订阅**：变更流直接读取修订表 —— `shift_results.seq` 即全局变更序号，修订与变更
+  天然同事务提交/回滚；序号由单例计数器行（`change_counter`）在写事务内
+  `UPDATE ... RETURNING` 递增分配，行锁持有至提交，故序号顺序 == 提交顺序，同步游标不会越过
+  尚未可见的较早变更；条目不可变，重读一致。既有库启动时自动迁移：为 `shift_results`
+  回填 `seq`（按原自增 id 顺序）并以最大序号初始化计数器。
 
 ## 项目结构
 
@@ -244,6 +322,7 @@ app/
 tests/
   test_attribution.py  # 算法单测（无外部依赖，可 python3 直接跑）
   test_api.py          # API 端到端测试（需 PostgreSQL）
+  test_changes.py      # 变更同步（游标分页/回放/并发）端到端测试（需 PostgreSQL）
 scripts/smoke.sh       # 冒烟脚本
 Dockerfile / docker-compose.yml / requirements.txt
 ```

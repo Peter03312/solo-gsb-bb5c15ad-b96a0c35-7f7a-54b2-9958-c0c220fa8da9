@@ -114,3 +114,26 @@ class ResultOut(BaseModel):
 class SettleResponse(BaseModel):
     settled: bool  # False 表示此前已结算，本次为幂等返回最新修订
     result: ResultOut
+
+
+class ChangeEntry(BaseModel):
+    """一次结算/更正产生的变更记录（与班次修订同一行存储，内容不可变）。"""
+
+    seq: int  # 全局递增变更序号（提交顺序），作为同步游标
+    shift_id: int
+    device_id: str
+    shift_start: datetime
+    shift_end: datetime
+    revision: int
+    totals: ReasonMinutes
+    delta: ReasonMinutes  # 本修订相对上一修订的差额
+    event_versions: list[EventVersionRef]
+    trigger: str  # settle | correction
+    created_at: datetime
+
+
+class ChangePage(BaseModel):
+    """一页变更；next_cursor 供下一页使用，空页保持原游标。"""
+
+    changes: list[ChangeEntry]
+    next_cursor: int
